@@ -131,4 +131,4 @@ Deno.serve(async (req) => {
 });
 
 // Every 2 minutes
-Deno.cron("poll-samsara", "*/2 * * * *", async () => { await pollOnce(); });
+Deno.cron("poll-samsara", "*/1 * * * *", async () => { await pollOnce(); });
