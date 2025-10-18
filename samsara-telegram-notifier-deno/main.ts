@@ -1,154 +1,137 @@
-/** Samsara → Telegram Notifier (Deno Deploy)
- * Single-file HTTP server. No DB.
- * Env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SAMSARA_WEBHOOK_SECRET (optional)
- */
+// Deno Deploy — Samsara polling → Telegram DM
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") ?? "";
-const WEBHOOK_SECRET = Deno.env.get("SAMSARA_WEBHOOK_SECRET") ?? "";
+const SAMSARA_TOKEN = Deno.env.get("SAMSARA_API_TOKEN") ?? "";
+const MIN_OIL_KPA = parseFloat(Deno.env.get("MIN_OIL_KPA") ?? "NaN");
+const MIN_AIR_KPA = parseFloat(Deno.env.get("MIN_AIR_KPA") ?? "NaN");
 
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.warn("[boot] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
+if (!BOT_TOKEN || !CHAT_ID || !SAMSARA_TOKEN) {
+  console.warn("[boot] Missing env: BOT_TOKEN/CHAT_ID/SAMSARA_API_TOKEN");
 }
 
-type SamsaraHeaders = {
-  "x-samsara-signature"?: string;
-  "content-type"?: string;
-  [k: string]: string | undefined;
-};
+function nowIso() { return new Date().toISOString(); }
 
-function hexToUint8Array(hex: string): Uint8Array {
-  const arr = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    arr[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return arr;
-}
-
-async function verifySignatureIfPresent(headers: SamsaraHeaders, rawBody: Uint8Array): Promise<boolean> {
-  const sig = headers["x-samsara-signature"];
-  if (!sig) return true; // allow if no signature header
-  if (!WEBHOOK_SECRET) return false; // signature header present but server has no secret
-  // Samsara commonly uses HMAC-SHA256 of raw body with the shared secret, hex-encoded
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(WEBHOOK_SECRET),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"],
-  );
-  const ok = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    hexToUint8Array(sig.replace(/^sha256=/i, "").trim()),
-    rawBody,
-  );
-  return ok;
-}
-
-function pick<T = unknown>(obj: any, path: string[], fallback?: T): T | undefined {
-  let cur = obj;
-  for (const p of path) {
-    if (cur && typeof cur === "object" && p in cur) cur = cur[p];
-    else return fallback;
-  }
-  return cur as T;
-}
-
-function isoNow(): string {
-  return new Date().toISOString();
-}
-
-function coerceText(payload: any): string {
-  // Try to extract common fields. Fall back to compact JSON.
-  const vehicle = pick<string>(payload, ["vehicle", "name"]) ||
-                  pick<string>(payload, ["vehicle", "label"]) ||
-                  pick<string>(payload, ["vehicleName"]) ||
-                  pick<string>(payload, ["asset", "name"]) ||
-                  pick<string>(payload, ["device", "name"]) ||
-                  "unknown";
-  const code = pick<string>(payload, ["fault", "code"]) ||
-               pick<string>(payload, ["dtc", "code"]) ||
-               pick<string>(payload, ["diagnostic", "code"]) ||
-               pick<string>(payload, ["spn"]) && pick<string>(payload, ["fmi"])
-                 ? `SPN ${pick<string>(payload, ["spn"])} FMI ${pick<string>(payload, ["fmi"])}`
-                 : undefined;
-  const desc = pick<string>(payload, ["fault", "description"]) ||
-               pick<string>(payload, ["description"]) ||
-               pick<string>(payload, ["alert", "description"]) ||
-               pick<string>(payload, ["message"]);
-  const metric = pick<string>(payload, ["metric", "name"]) ||
-                 pick<string>(payload, ["sensor", "name"]) ||
-                 pick<string>(payload, ["parameter"]) ||
-                 undefined;
-  const value = pick<string>(payload, ["metric", "value"]) ||
-                pick<string>(payload, ["value"]) ||
-                pick<string>(payload, ["reading"]) ||
-                undefined;
-  const severity = pick<string>(payload, ["severity"]) ||
-                   pick<string>(payload, ["fault", "severity"]) ||
-                   undefined;
-
-  const parts: string[] = [];
-  parts.push(`ALERT ${vehicle}`);
-  if (code) parts.push(code);
-  if (severity) parts.push(String(severity).toUpperCase());
-  if (metric && value) parts.push(`${metric}: ${value}`);
-  if (desc) parts.push(desc);
-  const head = parts.join(" | ");
-  // Append compact JSON for traceability
-  const comp = JSON.stringify(payload);
-  const body = comp.length <= 2048 ? comp : comp.substring(0, 2045) + "...";
-  return `${head}
-${body}`;
-}
-
-async function sendTelegram(text: string) {
+async function sendTelegram(text) {
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      chat_id: CHAT_ID,
-      text,
-      disable_notification: false,
-      parse_mode: "HTML", // keep plain text safe; no special tags used
-    }),
+    body: JSON.stringify({ chat_id: CHAT_ID, text }),
   });
   if (!r.ok) {
-    const err = await r.text().catch(() => "");
-    console.error("[telegram] send failed", r.status, err);
-    return Response.json({ ok: false, error: "telegram_send_failed", status: r.status }, { status: 502 });
+    console.error("[telegram] send failed", r.status, await r.text().catch(()=>"-"));
   }
-  return Response.json({ ok: true });
 }
 
-Deno.serve(async (req: Request) => {
-  const { method, url } = req;
-  const u = new URL(url);
-  if (method === "GET" && u.pathname === "/") {
-    return new Response("ok " + isoNow(), { status: 200 });
+const activeFaults = new Map();
+
+function faultKey(fc) {
+  const spn = fc?.spn ?? "";
+  const fmi = fc?.fmi ?? "";
+  const code = fc?.code ?? "";
+  return `spn:${spn}|fmi:${fmi}|code:${code}`;
+}
+function coerceVehicleName(v) {
+  return v?.vehicleName || v?.vehicleLabel || v?.name || String(v?.vehicleId ?? "unknown");
+}
+
+async function fetchVehicleStats(types = "faultCodes,engineOilPressureKPa", limit = 200) {
+  const items = [];
+  let after = undefined;
+
+  for (let page = 0; page < 20; page++) {
+    const url = new URL("https://api.samsara.com/fleet/vehicles/stats");
+    url.searchParams.set("types", types);
+    url.searchParams.set("limit", String(limit));
+    if (after) url.searchParams.set("after", after);
+
+    const r = await fetch(url.toString(), {
+      headers: {
+        "authorization": `Bearer ${SAMSARA_TOKEN}`,
+        "accept": "application/json",
+      },
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(()=>"-");
+      throw new Error(`[samsara] ${r.status} ${body}`);
+    }
+    const data = await r.json();
+    const pageItems = data?.data || data?.results || data?.items || [];
+    items.push(...pageItems);
+    after = data?.pagination?.endCursor || data?.pagination?.next || undefined;
+    if (!after) break;
   }
+  return items;
+}
 
-  if (method === "POST" && u.pathname === "/samsara") {
-    const raw = new Uint8Array(await req.arrayBuffer());
-    const headers = Object.fromEntries(req.headers) as SamsaraHeaders;
+function* computeAlerts(stats) {
+  for (const raw of stats) {
+    const v = {
+      vehicleId: raw?.vehicleId ?? raw?.id,
+      vehicleName: raw?.vehicleName ?? raw?.name ?? raw?.label,
+      faultCodes: raw?.faultCodes ?? raw?.stats?.faultCodes ?? raw?.dtc,
+      engineOilPressureKPa: raw?.engineOilPressureKPa ?? raw?.stats?.engineOilPressureKPa,
+    };
+    const vid = String(v.vehicleId ?? v.vehicleName ?? "unknown");
+    const vname = coerceVehicleName(v);
 
-    const verified = await verifySignatureIfPresent(headers, raw);
-    if (!verified) {
-      return Response.json({ ok: false, error: "invalid_signature" }, { status: 401 });
+    if (Array.isArray(v.faultCodes)) {
+      const prev = activeFaults.get(vid) ?? new Set();
+      const curr = new Set();
+      for (const fc of v.faultCodes) {
+        const k = faultKey(fc);
+        curr.add(k);
+        if (!prev.has(k)) {
+          const code = fc?.code || ((fc?.spn || fc?.spn===0) && (fc?.fmi || fc?.fmi===0) ? `SPN ${fc.spn} FMI ${fc.fmi}` : "DTC");
+          const desc = fc?.description ? ` | ${fc.description}` : "";
+          yield `🚨 ${vname} | ${code}${desc} | ${nowIso()}`;
+        }
+      }
+      activeFaults.set(vid, curr);
     }
 
-    let payload: any;
-    try {
-      payload = JSON.parse(new TextDecoder().decode(raw));
-    } catch {
-      return Response.json({ ok: false, error: "invalid_json" }, { status: 400 });
+    if (!Number.isNaN(MIN_OIL_KPA) && typeof v.engineOilPressureKPa === "number") {
+      if (v.engineOilPressureKPa < MIN_OIL_KPA) {
+        yield `⚠️ ${vname} | Oil Pressure ${v.engineOilPressureKPa} kPa < ${MIN_OIL_KPA} kPa | ${nowIso()}`;
+      }
     }
-
-    const text = coerceText(payload);
-    const tgResp = await sendTelegram(text);
-    return tgResp;
   }
+}
 
-  return new Response("Not found", { status: 404 });
+async function pollOnce() {
+  try {
+    const stats = await fetchVehicleStats();
+    let count = 0;
+    for (const msg of computeAlerts(stats)) {
+      count++;
+      await sendTelegram(msg);
+    }
+    if (count === 0) {
+      console.log("[poll] no new alerts", nowIso());
+    } else {
+      console.log("[poll] sent", count, "alerts", nowIso());
+    }
+  } catch (e) {
+    console.error("[poll] error", e?.message || e);
+    await sendTelegram(`Samsara poll error: ${e?.message || e}`);
+  }
+}
+
+// HTTP server
+Deno.serve((req) => {
+  const u = new URL(req.url);
+  if (u.pathname === "/") return new Response("ok " + nowIso());
+  if (u.pathname === "/samsara" && req.method === "POST") {
+    return new Response(JSON.stringify({ ok: true, mode: "polling" }), { headers: { "content-type": "application/json" } });
+  }
+  if (u.pathname === "/poll" && req.method === "POST") {
+    queueMicrotask(() => pollOnce());
+    return new Response(JSON.stringify({ ok: true, queued: true }), { headers: { "content-type": "application/json" } });
+  }
+  return new Response("not found", { status: 404 });
+});
+
+// Every 2 minutes
+Deno.cron("poll-samsara", "*/2 * * * *", async () => {
+  await pollOnce();
 });
