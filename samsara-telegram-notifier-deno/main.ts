@@ -64,7 +64,7 @@ async function fetchVehicleStats(types = "faultCodes,engineOilPressureKPa", limi
     if (after) url.searchParams.set("after", after);
 
     const r = await fetch(url.toString(), {
-      headers: { authorization: `Bearer ${SAMsARA_TOKEN}`, accept: "application/json" },
+headers: { authorization: `Bearer ${SAMSARA_TOKEN}`, accept: "application/json" },
     } as any).catch((e) => {
       throw new Error(`network: ${e?.message || e}`);
     });
