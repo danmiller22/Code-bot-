@@ -33,7 +33,7 @@ function coerceVehicleName(v) {
   return v?.vehicleName || v?.vehicleLabel || v?.name || String(v?.vehicleId ?? "unknown");
 }
 
-async function fetchVehicleStats(types = "faultCodes,engineOilPressureKPa,airPressureKPa", limit = 200) {
+async function fetchVehicleStats(types = "faultCodes,engineOilPressureKPa", limit = 200) {
   const items = [];
   let after = undefined;
   for (let page = 0; page < 20; page++) {
